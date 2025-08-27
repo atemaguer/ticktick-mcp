@@ -1,19 +1,20 @@
-from fastmcp.client.transports import StdioTransport
-from fastmcp.client import Client
 import asyncio
+from fastmcp import Client, FastMCP
 
-transport = StdioTransport(
-    command="npx",
-    args=["-p", "mcp-remote", "https://ticktick-mcp.fly.dev/sse"]
-)
+client = Client("https://ticktick-mcp.fastmcp.app/mcp")
 
-client = Client(transport)
-
-async def get_all_tasks():
+async def main():
     async with client:
+        # Ensure client can connect
         await client.ping()
-    
-    async with client:  # Reuses the same subprocess
-        await client.call_tool("get_all_tasks", {})
 
-asyncio.run(get_all_tasks())
+        # List available operations
+        tools = await client.list_tools()
+        resources = await client.list_resources()
+        prompts = await client.list_prompts()
+
+        # Ex. execute a tool call
+        result = await client.call_tool("get_all_tasks", {})
+        print(result)
+
+asyncio.run(main())
