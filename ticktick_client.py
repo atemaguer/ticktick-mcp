@@ -15,19 +15,13 @@ class TickTickClient:
     Client for the TickTick API using OAuth2 authentication.
     """
     
-    def __init__(self):
-        load_dotenv()
-        self.client_id = os.getenv("TICKTICK_CLIENT_ID")
-        self.client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
-        self.access_token = os.getenv("TICKTICK_ACCESS_TOKEN")
-        self.refresh_token = os.getenv("TICKTICK_REFRESH_TOKEN")
-        
-        if not self.access_token:
-            raise ValueError("TICKTICK_ACCESS_TOKEN environment variable is not set. "
-                            "Please run 'uv run -m ticktick_mcp.authenticate' to set up your credentials.")
-            
-        self.base_url = os.getenv("TICKTICK_BASE_URL") or "https://api.ticktick.com/open/v1"
-        self.token_url = os.getenv("TICKTICK_TOKEN_URL") or "https://ticktick.com/oauth/token"
+    def __init__(self, access_token: str):
+        self.access_token = access_token
+        self.refresh_token = None
+
+        self.base_url = "https://api.ticktick.com/open/v1"
+        self.token_url = "https://ticktick.com/oauth/token"
+
         self.headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",

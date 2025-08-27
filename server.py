@@ -5,34 +5,105 @@ import logging
 from datetime import datetime, timezone, date, timedelta
 from typing import Dict, List, Any, Optional
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+# OAuth Proxy is automatically configured by FastMCP from environment variables
 from dotenv import load_dotenv
+from fastmcp.server.dependencies import get_http_request
+from starlette.requests import Request
 
-from .ticktick_client import TickTickClient
+import modal
+
+# Delay importing TickTickClient to runtime to avoid ModuleNotFoundError during container import
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create FastMCP server
-mcp = FastMCP("ticktick")
+# Load environment variables (enables OAuth Proxy auto-config if set)
+load_dotenv()
+
+# OAuth Proxy setup for TickTick (non-DCR provider)
+def create_oauth_proxy():
+    """Create OAuth Proxy for TickTick if credentials are available"""
+    try:
+        from fastmcp.server.auth import OAuthProxy
+    except ImportError:
+        print("⚠️  OAuthProxy not available in this FastMCP version")
+        return None
+    
+    client_id = os.getenv("TICKTICK_CLIENT_ID")
+    client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
+    # Use the Modal app URL for production, fallback to localhost for local testing
+    base_url = os.getenv("FASTMCP_SERVER_AUTH_OAUTH_PROXY_BASE_URL", "http://localhost:8000")
+    
+    if not (client_id and client_secret):
+        print("⚠️  No TickTick OAuth credentials found. Set TICKTICK_CLIENT_ID and TICKTICK_CLIENT_SECRET")
+        return None
+    
+    print(f"✅ Creating OAuth Proxy for TickTick (client_id: {client_id[:8]}...)")
+    
+    # Minimal token verifier for TickTick opaque tokens
+    from fastmcp.server.auth.oauth_proxy import TokenVerifier, AccessToken
+
+    class TickTickTokenVerifier(TokenVerifier):
+        def __init__(self, client_id: str, resource_server_url: str | None = None):
+            super().__init__(resource_server_url=resource_server_url, required_scopes=[])
+            self._client_id = client_id
+
+        async def verify_token(self, token: str) -> AccessToken | None:
+            return AccessToken(token=token, client_id=self._client_id, scopes=[], expires_at=None, resource=str(self.resource_server_url) if self.resource_server_url else None)
+    
+    return OAuthProxy(
+        upstream_authorization_endpoint="https://ticktick.com/oauth/authorize",
+        upstream_token_endpoint="https://ticktick.com/oauth/token",
+        upstream_client_id=client_id,
+        upstream_client_secret=client_secret,
+        token_verifier=TickTickTokenVerifier(client_id=client_id, resource_server_url=base_url),
+        base_url=base_url,
+        redirect_path="/auth/callback",
+        allowed_client_redirect_uris=["http://localhost:*", "http://127.0.0.1:*", "https://*.modal.run"]
+    )
+
+# Create FastMCP server with OAuth Proxy if available
+oauth_proxy = create_oauth_proxy()
+if oauth_proxy:
+    print("🔐 Starting MCP server with OAuth Proxy for TickTick")
+    mcp = FastMCP("ticktick", auth=oauth_proxy)
+else:
+    print("🔓 Starting MCP server without OAuth (manual token required)")
+    mcp = FastMCP("ticktick")
 
 # Create TickTick client
 ticktick = None
 
+def get_auth_token():
+    """Get OAuth access token from FastMCP auth context or fallback to environment."""
+    # Try to get token from FastMCP OAuth identity (when OAuth Proxy is used)
+    try:
+        from fastmcp.server.dependencies import get_identity
+        identity = get_identity()
+        if identity and hasattr(identity, 'access_token'):
+            return identity.access_token
+    except Exception:
+        # get_identity not available or no identity context
+        pass
+    
+    # Fallback to environment variables for testing
+    return os.getenv("TICKTICK_AUTH_TOKEN") or os.getenv("AUTH_TOKEN")
+
+
 def initialize_client():
     global ticktick
     try:
-        # Check if .env file exists with access token
-        load_dotenv()
-        
-        # Check if we have valid credentials
-        if os.getenv("TICKTICK_ACCESS_TOKEN") is None:
-            logger.error("No access token found in .env file. Please run 'uv run -m ticktick_mcp.cli auth' to authenticate.")
+        access_token = get_auth_token()
+        if not access_token:
+            logger.error("No access token available from OAuth context or headers.")
             return False
-        
-        # Initialize the client
-        ticktick = TickTickClient()
+
+
+        # Initialize the client (import lazily so the module doesn't need to exist at import time)
+        from ticktick_client import TickTickClient  # noqa: WPS433
+        ticktick = TickTickClient(access_token)
         logger.info("TickTick client initialized successfully")
         
         # Test API connectivity
@@ -218,7 +289,7 @@ async def create_task(
     content: str = None, 
     start_date: str = None, 
     due_date: str = None, 
-    priority: int = 0
+    priority: int = 0,
 ) -> str:
     """
     Create a new task in TickTick.
@@ -274,7 +345,7 @@ async def update_task(
     content: str = None,
     start_date: str = None,
     due_date: str = None,
-    priority: int = None
+    priority: int = None,
 ) -> str:
     """
     Update an existing task in TickTick.
@@ -374,7 +445,7 @@ async def delete_task(project_id: str, task_id: str) -> str:
 async def create_project(
     name: str,
     color: str = "#F18181",
-    view_mode: str = "list"
+    view_mode: str = "list",
 ) -> str:
     """
     Create a new project in TickTick.
@@ -981,15 +1052,79 @@ async def create_subtask(
         logger.error(f"Error in create_subtask: {e}")
         return f"Error creating subtask: {str(e)}"
 
+
+@mcp.tool()
+async def test_tool() -> str:
+    """
+    Test tool.
+    """
+    if not ticktick:
+        if not initialize_client():
+            return "Failed to initialize TickTick client. Please check your API credentials."
+    
+    projects = ticktick.get_projects()
+    if 'error' in projects:
+        return f"Error fetching projects: {projects['error']}"
+    
+    return f"Test tool works with {len(projects)} projects"
+
 def main():
     """Main entry point for the MCP server."""
-    # Initialize the TickTick client
-    if not initialize_client():
-        logger.error("Failed to initialize TickTick client. Please check your API credentials.")
-        return
-    
     # Run the server
-    mcp.run(transport='stdio')
+    # mcp.run(transport="http")
+    mcp.run(transport="sse")
+
+
+
+
+image = modal.Image.debian_slim(python_version="3.12").apt_install("git").pip_install(
+    "fastapi[standard]",
+    "git+https://github.com/jlowin/fastmcp.git@main",
+    "mcp[cli]",
+    "python-dotenv",
+    "requests",
+    "uvicorn",
+).add_local_dir(".", remote_path="/root")
+app = modal.App(name="ticktickmcp", image=image)
+
+@app.function(image=image)
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def web_app():
+    # Return the MCP app directly - this creates the simplest deployment
+    # The SSE endpoint will be available at the root URL
+    return mcp.http_app(path='/', transport="sse")
+
+
+def create_app():
+    """Create the FastAPI app for local testing"""
+    from fastapi import FastAPI
+    
+    # Create the MCP ASGI app
+    mcp_app = mcp.http_app(path='/mcp', transport="sse")
+    
+    # Create main FastAPI app with MCP lifespan for proper initialization
+    web_app = FastAPI(
+        title="TickTick MCP Server",
+        lifespan=mcp_app.lifespan
+    )
+    
+    # Mount the MCP app under /mcp path
+    web_app.mount("/mcp", mcp_app)
+    
+    # Add a simple info endpoint
+    @web_app.get("/")
+    async def root():
+        return {
+            "message": "TickTick MCP Server (Local)",
+            "mcp_endpoint": "/mcp",
+            "sse_endpoint": "/mcp/sse",
+            "version": "local-test"
+        }
+    
+    return web_app
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    app = create_app()
+    uvicorn.run(app, host="0.0.0.0", port=8000)
