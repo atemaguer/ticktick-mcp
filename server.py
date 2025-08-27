@@ -11,8 +11,6 @@ from dotenv import load_dotenv
 from fastmcp.server.dependencies import get_http_request
 from starlette.requests import Request
 
-import modal
-
 # Delay importing TickTickClient to runtime to avoid ModuleNotFoundError during container import
 
 # Set up logging
