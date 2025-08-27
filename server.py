@@ -20,18 +20,22 @@ logger = logging.getLogger(__name__)
 # Load environment variables (enables OAuth Proxy auto-config if set)
 load_dotenv()
 
-# OAuth Proxy setup for TickTick (non-DCR provider)
+
+# OAuth Proxy setup for TickTick (following FastMCP documentation)
 def create_oauth_proxy():
-    """Create OAuth Proxy for TickTick if credentials are available"""
+    """Create OAuth Proxy for TickTick according to FastMCP docs"""
     try:
         from fastmcp.server.auth import OAuthProxy
-    except ImportError:
-        print("⚠️  OAuthProxy not available in this FastMCP version")
+        from fastmcp.server.auth.oauth_proxy import TokenVerifier, AccessToken
+        import aiohttp
+    except ImportError as e:
+        print(f"⚠️  OAuthProxy not available in this FastMCP version: {e}")
         return None
     
-    client_id = os.getenv("TICKTICK_CLIENT_ID")
-    client_secret = os.getenv("TICKTICK_CLIENT_SECRET")
-    # Use the Modal app URL for production, fallback to localhost for local testing
+    # Get OAuth credentials from environment
+    client_id = os.getenv("FASTMCP_SERVER_AUTH_OAUTH_PROXY_UPSTREAM_CLIENT_ID") or os.getenv("TICKTICK_CLIENT_ID")
+    client_secret = os.getenv("FASTMCP_SERVER_AUTH_OAUTH_PROXY_UPSTREAM_CLIENT_SECRET") or os.getenv("TICKTICK_CLIENT_SECRET")
+    # Use localhost for local testing, production URL when deployed
     base_url = os.getenv("FASTMCP_SERVER_AUTH_OAUTH_PROXY_BASE_URL", "http://localhost:8000")
     
     if not (client_id and client_secret):
@@ -39,18 +43,45 @@ def create_oauth_proxy():
         return None
     
     print(f"✅ Creating OAuth Proxy for TickTick (client_id: {client_id[:8]}...)")
+    print(f"🌐 Base URL: {base_url}")
     
-    # Minimal token verifier for TickTick opaque tokens
-    from fastmcp.server.auth.oauth_proxy import TokenVerifier, AccessToken
-
+    # Custom token verifier for TickTick (opaque tokens)
     class TickTickTokenVerifier(TokenVerifier):
         def __init__(self, client_id: str, resource_server_url: str | None = None):
             super().__init__(resource_server_url=resource_server_url, required_scopes=[])
             self._client_id = client_id
 
         async def verify_token(self, token: str) -> AccessToken | None:
-            return AccessToken(token=token, client_id=self._client_id, scopes=[], expires_at=None, resource=str(self.resource_server_url) if self.resource_server_url else None)
+            """Verify token by calling TickTick's user profile endpoint"""
+            try:
+                async with aiohttp.ClientSession() as session:
+                    headers = {
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json"
+                    }
+                    async with session.get("https://api.ticktick.com/open/v1/project", headers=headers) as response:
+                        if response.status == 200:
+                            projects_data = await response.json()
+                            # TickTick /project endpoint returns a list of projects
+                            if isinstance(projects_data, list):
+                                logger.info(f"Token verified successfully with {len(projects_data)} projects")
+                            else:
+                                logger.info(f"Token verified successfully")
+                            return AccessToken(
+                                token=token, 
+                                client_id=self._client_id, 
+                                scopes=[], 
+                                expires_at=None,
+                                resource=str(self.resource_server_url) if self.resource_server_url else None
+                            )
+                        else:
+                            logger.warning(f"Token verification failed with status {response.status}")
+                            return None
+            except Exception as e:
+                logger.error(f"Token verification error: {e}")
+                return None
     
+    # Create OAuth proxy according to FastMCP documentation
     return OAuthProxy(
         upstream_authorization_endpoint="https://ticktick.com/oauth/authorize",
         upstream_token_endpoint="https://ticktick.com/oauth/token",
@@ -59,10 +90,14 @@ def create_oauth_proxy():
         token_verifier=TickTickTokenVerifier(client_id=client_id, resource_server_url=base_url),
         base_url=base_url,
         redirect_path="/auth/callback",
-        allowed_client_redirect_uris=["http://localhost:*", "http://127.0.0.1:*", "https://*.modal.run"]
+        allowed_client_redirect_uris=[
+            "http://localhost:*", 
+                            "http://127.0.0.1:*", 
+                "https://*.fly.dev"
+            ]
     )
 
-# Create FastMCP server with OAuth Proxy if available
+# Create FastMCP server with OAuth Proxy
 oauth_proxy = create_oauth_proxy()
 if oauth_proxy:
     print("🔐 Starting MCP server with OAuth Proxy for TickTick")
@@ -80,14 +115,40 @@ def get_auth_token():
     try:
         from fastmcp.server.dependencies import get_identity
         identity = get_identity()
-        if identity and hasattr(identity, 'access_token'):
-            return identity.access_token
-    except Exception:
-        # get_identity not available or no identity context
-        pass
+        if identity:
+            # Try different ways to access the token
+            if hasattr(identity, 'access_token'):
+                logger.info(f"Found access token via identity.access_token")
+                return identity.access_token
+            elif hasattr(identity, 'token'):
+                logger.info(f"Found access token via identity.token")
+                return identity.token
+            else:
+                logger.info(f"Identity object: {type(identity)}, attributes: {dir(identity)}")
+    except Exception as e:
+        logger.info(f"Could not get identity: {e}")
+    
+    # Try to get from request headers if available
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        request = get_http_request()
+        if request and hasattr(request, 'headers'):
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                token = auth_header[7:]  # Remove 'Bearer ' prefix
+                logger.info(f"Found access token in Authorization header")
+                return token
+    except Exception as e:
+        logger.info(f"Could not get token from headers: {e}")
     
     # Fallback to environment variables for testing
-    return os.getenv("TICKTICK_AUTH_TOKEN") or os.getenv("AUTH_TOKEN")
+    env_token = os.getenv("TICKTICK_AUTH_TOKEN") or os.getenv("AUTH_TOKEN")
+    if env_token:
+        logger.info(f"Using token from environment variables")
+        return env_token
+    
+    logger.error(f"No access token found in any location")
+    return None
 
 
 def initialize_client():
@@ -1068,61 +1129,9 @@ async def test_tool() -> str:
 
 def main():
     """Main entry point for the MCP server."""
-    # Run the server
-    # mcp.run(transport="http")
+    # Run the server with SSE transport
     mcp.run(transport="sse")
 
-
-
-
-image = modal.Image.debian_slim(python_version="3.12").apt_install("git").pip_install(
-    "fastapi[standard]",
-    "git+https://github.com/jlowin/fastmcp.git@main",
-    "mcp[cli]",
-    "python-dotenv",
-    "requests",
-    "uvicorn",
-).add_local_dir(".", remote_path="/root")
-app = modal.App(name="ticktickmcp", image=image)
-
-@app.function(image=image)
-@modal.concurrent(max_inputs=100)
-@modal.asgi_app()
-def web_app():
-    # Return the MCP app directly - this creates the simplest deployment
-    # The SSE endpoint will be available at the root URL
-    return mcp.http_app(path='/', transport="sse")
-
-
-def create_app():
-    """Create the FastAPI app for local testing"""
-    from fastapi import FastAPI
-    
-    # Create the MCP ASGI app
-    mcp_app = mcp.http_app(path='/mcp', transport="sse")
-    
-    # Create main FastAPI app with MCP lifespan for proper initialization
-    web_app = FastAPI(
-        title="TickTick MCP Server",
-        lifespan=mcp_app.lifespan
-    )
-    
-    # Mount the MCP app under /mcp path
-    web_app.mount("/mcp", mcp_app)
-    
-    # Add a simple info endpoint
-    @web_app.get("/")
-    async def root():
-        return {
-            "message": "TickTick MCP Server (Local)",
-            "mcp_endpoint": "/mcp",
-            "sse_endpoint": "/mcp/sse",
-            "version": "local-test"
-        }
-    
-    return web_app
-
 if __name__ == "__main__":
-    import uvicorn
-    app = create_app()
-    uvicorn.run(app, host="0.0.0.0", port=os.getenv("PORT", 8000))
+    # Use FastMCP's built-in server for simpler configuration
+    main()

@@ -3,3 +3,4 @@ fastmcp @ git+https://github.com/jlowin/fastmcp.git@main
 python-dotenv>=1.0.0,<2.0.0
 requests>=2.30.0,<3.0.0
 fastapi>=0.115.0,<0.120.0
+aiohttp>=3.8.0,<4.0.0

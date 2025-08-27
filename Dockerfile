@@ -26,4 +26,4 @@ USER appuser
 EXPOSE 8000
 
 # Run the application
-CMD ["python", "fly_server.py"]
+CMD ["python", "server.py"]
